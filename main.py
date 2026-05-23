@@ -3,19 +3,20 @@ import concurrent.futures
 import re
 import os
 import time
+import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
 from groq import Groq
 from huggingface_hub import InferenceClient
 import openai
 
-# ── Load .env file ────────────────────────────────────────────────────────────
+# ── Load .env file ─────────────────────────────────────────────────────────
 load_dotenv()
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AEO Diagnostic", page_icon="🔍", layout="wide")
 
-# ── Styles ────────────────────────────────────────────────────────────────────
+# ── Styles ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   .stApp { background: #0f0f0f; color: #f0f0f0; }
@@ -36,16 +37,141 @@ st.markdown("""
   .mention-chip.target { background:#1a3d1a; border-color:#22c55e; font-weight:700; }
   .divider { border-top:1px solid #222; margin:32px 0; }
   .summary-bar { background:#1a1a1a; border-radius:12px; padding:20px 24px; margin-bottom:24px; }
-  .key-status { font-size:0.82rem; padding:2px 0; }
-  .warn-box { background:#2e2200; border:1px solid #eab308; border-radius:8px; padding:10px 14px; font-size:0.85rem; margin-bottom:8px; }
+  .status-bar { background:#161616; border:1px solid #2a2a2a; border-radius:10px; padding:12px 18px; margin-bottom:8px; font-size:0.82rem; }
+  .lock-screen { max-width:420px; margin:80px auto; background:#161616; border:1px solid #2a2a2a; border-radius:16px; padding:40px 36px; text-align:center; }
+  .lock-title { font-size:2rem; font-weight:800; margin-bottom:8px; }
+  .lock-sub   { color:#888; font-size:0.95rem; margin-bottom:28px; }
+  .cap-bar    { background:#1a1a1a; border:1px solid #333; border-radius:10px; padding:10px 16px; font-size:0.82rem; margin-top:8px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 1: PASSWORD GATE ──────────────────────────────────────────────────
+# Set APP_PASSWORD in Railway env vars. If not set, gate is disabled.
+# ══════════════════════════════════════════════════════════════════════════════
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+if APP_PASSWORD:
+    # Keep auth state across reruns
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.markdown("""
+        <div class="lock-screen">
+            <div class="lock-title">🔐 AEO Diagnostic</div>
+            <div class="lock-sub">This tool is password protected.<br>Enter your access password to continue.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_a, col_b, col_c = st.columns([1, 2, 1])
+        with col_b:
+            entered = st.text_input("Password", type="password", label_visibility="collapsed",
+                                    placeholder="Enter password…")
+            login_btn = st.button("Unlock →", use_container_width=True, type="primary")
+
+            if login_btn or (entered and entered == APP_PASSWORD):
+                if entered == APP_PASSWORD:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("❌ Incorrect password. Please try again.")
+        st.stop()  # Block everything below until authenticated
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 2: RATE LIMITING ──────────────────────────────────────────────────
+# Per-IP: max 5 runs/hour  |  Global: max 200 runs/day across all users
+# ══════════════════════════════════════════════════════════════════════════════
+
+PER_IP_LIMIT   = 5      # max requests per IP per hour
+PER_IP_WINDOW  = 3600   # seconds (1 hour)
+DAILY_GLOBAL_LIMIT = 200  # total runs per day across ALL users
+
+
+def get_ip_key() -> str:
+    """Return a hashed, anonymous identifier for the current visitor."""
+    try:
+        ip = st.context.ip_address or "unknown"
+    except Exception:
+        ip = "unknown"
+    return "ip_" + hashlib.md5(ip.encode()).hexdigest()[:12]
+
+
+def check_per_ip_limit() -> tuple[bool, int]:
+    """
+    Check per-IP rate limit.
+    Returns (allowed, remaining_requests_or_wait_seconds).
+    """
+    now  = time.time()
+    key  = get_ip_key()
+    slot = f"rl_{key}"
+
+    if slot not in st.session_state:
+        st.session_state[slot] = []
+
+    # Purge timestamps outside the window
+    st.session_state[slot] = [t for t in st.session_state[slot] if now - t < PER_IP_WINDOW]
+
+    if len(st.session_state[slot]) >= PER_IP_LIMIT:
+        wait = int(PER_IP_WINDOW - (now - st.session_state[slot][0]))
+        return False, wait
+
+    return True, PER_IP_LIMIT - len(st.session_state[slot])
+
+
+def check_global_cap() -> tuple[bool, int]:
+    """
+    Check daily global cap across all users.
+    Returns (allowed, used_count).
+    Uses st.session_state as a shared store (works per-process on Railway).
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if "global_date" not in st.session_state or st.session_state.global_date != today:
+        st.session_state.global_date  = today
+        st.session_state.global_count = 0
+
+    if st.session_state.global_count >= DAILY_GLOBAL_LIMIT:
+        return False, st.session_state.global_count
+
+    return True, st.session_state.global_count
+
+
+def record_request():
+    """Log a new request for both IP and global counters."""
+    now = time.time()
+    key  = get_ip_key()
+    slot = f"rl_{key}"
+
+    if slot not in st.session_state:
+        st.session_state[slot] = []
+    st.session_state[slot].append(now)
+
+    if "global_count" not in st.session_state:
+        st.session_state.global_count = 0
+    st.session_state.global_count += 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 3: API KEYS (server-side only, never exposed to browser) ──────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_keys() -> dict:
+    return {
+        "groq":        os.getenv("GROQ_API_KEY", ""),
+        "openrouter":  os.getenv("OPENROUTER_API_KEY", ""),
+        "huggingface": os.getenv("HF_API_KEY", ""),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 4: API HELPERS ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def query_groq(prompt: str, api_key: str) -> str:
-    """Query Groq API with Llama 3.3 70B."""
     client = Groq(api_key=api_key)
     resp = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -56,28 +182,15 @@ def query_groq(prompt: str, api_key: str) -> str:
 
 
 def query_openrouter(prompt: str, api_key: str) -> str:
-    """
-    Query OpenRouter with free model fallbacks.
-    Tries multiple free models in order until one succeeds.
-    Get your free key at: https://openrouter.ai/keys
-    """
-    # Free models on OpenRouter (no billing required)
-    # openrouter/free auto-picks any available free model — never 404s
     model_candidates = [
-        "openrouter/free",                           # ✅ auto-router, always works
-        "deepseek/deepseek-chat-v3-0324:free",       # DeepSeek V3 — best quality
-        "meta-llama/llama-3.3-70b-instruct:free",    # Llama 3.3 70B
-        "mistralai/mistral-small-3.1:free",          # Mistral Small 3.1
-        "nvidia/nemotron-nano-12b-v2-vl:free",       # NVIDIA Nemotron — reliable
+        "openrouter/free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "mistralai/mistral-small-3.1:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
     ]
-
-    client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
-
+    client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     last_error = None
-
     for model_name in model_candidates:
         try:
             resp = client.chat.completions.create(
@@ -85,27 +198,17 @@ def query_openrouter(prompt: str, api_key: str) -> str:
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=600,
             )
-            return resp.choices[0].message.content  # ✅ success
-
+            return resp.choices[0].message.content
         except Exception as e:
             err_str = str(e)
-            # 429 or context limit — try next model
-            if "429" in err_str or "rate" in err_str.lower() or "context" in err_str.lower():
+            if any(x in err_str for x in ["429", "rate", "context", "404", "not found"]):
                 last_error = e
                 continue
-            # 404 model not found — try next
-            elif "404" in err_str or "not found" in err_str.lower():
-                last_error = e
-                continue
-            # Any other error — raise immediately
-            else:
-                raise
-
+            raise
     raise RuntimeError(f"All OpenRouter models failed. Last error: {last_error}")
 
 
 def query_huggingface(prompt: str, api_key: str) -> str:
-    """Query HuggingFace Inference API with Qwen 2.5 7B."""
     client = InferenceClient(api_key=api_key)
     response = client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
@@ -116,7 +219,9 @@ def query_huggingface(prompt: str, api_key: str) -> str:
     return response.choices[0].message.content.strip()
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 5: SCORING ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def extract_products(text: str) -> list:
     raw = re.findall(r'\b([A-Z][a-z]+(?: [A-Z][a-z]+)*)\b', text)
@@ -134,24 +239,24 @@ def extract_products(text: str) -> list:
 
 
 def score_response(text: str, target: str) -> dict:
-    text_lower = text.lower()
+    text_lower   = text.lower()
     target_lower = target.lower().strip()
-    products = extract_products(text)
+    products     = extract_products(text)
 
     if not target_lower:
         return {"rank": None, "mentions": 0, "total_products": len(products),
                 "score": None, "grade": "—", "products": products}
 
     mentions = len(re.findall(re.escape(target_lower), text_lower))
-    lines = re.split(r'[\n.•\-\d\.]', text_lower)
-    rank = next((i for i, l in enumerate(lines, 1) if target_lower in l), None)
+    lines    = re.split(r'[\n.•\-\d\.]', text_lower)
+    rank     = next((i for i, l in enumerate(lines, 1) if target_lower in l), None)
 
     if mentions == 0:
         score = 0
     else:
-        base = 40 + (min(mentions, 5) * 8)
+        base           = 40 + (min(mentions, 5) * 8)
         position_bonus = max(0, 20 - ((rank or 10) * 2))
-        score = min(100, base + position_bonus)
+        score          = min(100, base + position_bonus)
 
     grade = ("A" if score >= 85 else "B" if score >= 70 else
              "C" if score >= 50 else "D" if score >= 30 else "F")
@@ -160,50 +265,57 @@ def score_response(text: str, target: str) -> dict:
             "score": score, "grade": grade, "products": products}
 
 
-def resolve_key(env_var: str, sidebar_val: str) -> str:
-    return sidebar_val.strip() if sidebar_val.strip() else os.getenv(env_var, "")
-
-
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION 6: MAIN UI ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 st.markdown("# 🔍 AEO Diagnostic")
 st.markdown("### See how **Llama 3, DeepSeek & Qwen** rank your product — all free APIs")
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-# Sidebar
+# ── Sidebar ──
 with st.sidebar:
-    st.markdown("## ⚙️ API Keys")
-    st.caption("Loaded from `.env` automatically, or paste here.")
+    st.markdown("## ⚙️ API Status")
+    st.caption("Keys are configured server-side.")
 
-    groq_input   = st.text_input("🟢 Groq (Llama 3) — free",   type="password", placeholder="gsk_...")
-    gemini_input = st.text_input("🔵 OpenRouter — free",         type="password", placeholder="sk-or-...")
-    hf_input     = st.text_input("🟡 HuggingFace — free",       type="password", placeholder="hf_...")
-
-    st.markdown("**Status:**")
-    for label, env_var, inp in [
-        ("Groq",         "GROQ_API_KEY",   groq_input),
-        ("OpenRouter",    "OPENROUTER_API_KEY", gemini_input),
-        ("HuggingFace",  "HF_API_KEY",     hf_input),
-    ]:
-        resolved = resolve_key(env_var, inp)
-        if resolved:
-            src = "sidebar" if inp.strip() else ".env file"
-            st.markdown(f'<div class="key-status">✅ {label} — <code>{src}</code></div>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="key-status">❌ {label} — not set</div>', unsafe_allow_html=True)
+    keys = get_keys()
+    for label, val in [("🟢 Groq (Llama 3)", keys["groq"]),
+                       ("🔵 OpenRouter",      keys["openrouter"]),
+                       ("🟡 HuggingFace",     keys["huggingface"])]:
+        status = "✅ configured" if val else "❌ missing"
+        color  = "#22c55e" if val else "#ef4444"
+        st.markdown(
+            f'<div class="status-bar">{label} — <span style="color:{color}">{status}</span></div>',
+            unsafe_allow_html=True
+        )
 
     st.markdown("---")
-    st.markdown("**Get free keys:**")
-    st.markdown("🔗 [Groq Console](https://console.groq.com)  \n"
-                "🔗 [OpenRouter Keys](https://openrouter.ai/keys)  \n"
-                "🔗 [HuggingFace Tokens](https://huggingface.co/settings/tokens)")
+
+    # Per-IP usage indicator
+    ip_ok, ip_remaining = check_per_ip_limit()
+    global_ok, global_used = check_global_cap()
+
+    if ip_ok:
+        st.markdown(f"**🚦 Your usage:** {ip_remaining} run{'s' if ip_remaining != 1 else ''} left this hour")
+    else:
+        mins = ip_remaining // 60
+        st.warning(f"⏳ Hourly limit reached. Resets in ~{mins} min.")
+
+    # Global daily cap progress bar
+    pct = min(global_used / DAILY_GLOBAL_LIMIT, 1.0)
+    bar_color = "#22c55e" if pct < 0.7 else "#eab308" if pct < 0.9 else "#ef4444"
+    st.markdown(
+        f'<div class="cap-bar">📊 Daily server capacity: '
+        f'<b style="color:{bar_color}">{global_used}/{DAILY_GLOBAL_LIMIT}</b> runs used</div>',
+        unsafe_allow_html=True
+    )
 
     st.markdown("---")
-    st.markdown("**OpenRouter free models tried (in order):**")
-    st.caption("openrouter/free (auto) → DeepSeek V3 → Llama 3.3 70B → Mistral Small 3.1")
+    st.markdown("**Models used:**")
+    st.caption("• Llama 3.3 70B via Groq\n• DeepSeek V3 via OpenRouter\n• Qwen 2.5 7B via HuggingFace")
 
-# Main form
+
+# ── Main form ──
 col1, col2 = st.columns([2, 1])
 with col1:
     query = st.text_input("🛍️ Shopper query",
@@ -214,20 +326,43 @@ with col2:
 
 run = st.button("🚀 Run Diagnostic", use_container_width=True, type="primary")
 
-# ── Execute ───────────────────────────────────────────────────────────────────
+
+# ── Execute ──
 if run:
     if not query:
         st.error("Please enter a shopper query.")
         st.stop()
 
-    groq_key   = resolve_key("GROQ_API_KEY",   groq_input)
-    gemini_key = resolve_key("OPENROUTER_API_KEY", gemini_input)
-    hf_key     = resolve_key("HF_API_KEY",     hf_input)
-
-    missing = [n for n, k in [("Groq", groq_key), ("OpenRouter", gemini_key), ("HuggingFace", hf_key)] if not k]
-    if missing:
-        st.error(f"Missing API keys: **{', '.join(missing)}** — add in sidebar or `.env` file.")
+    # ── Gate 1: Per-IP rate limit ──
+    ip_ok, ip_val = check_per_ip_limit()
+    if not ip_ok:
+        mins = ip_val // 60
+        st.error(
+            f"⏳ You've used all {PER_IP_LIMIT} runs for this hour. "
+            f"Please come back in ~{mins} minute(s)."
+        )
         st.stop()
+
+    # ── Gate 2: Global daily cap ──
+    global_ok, global_used = check_global_cap()
+    if not global_ok:
+        st.error(
+            f"🚫 The tool has reached its daily limit of {DAILY_GLOBAL_LIMIT} runs. "
+            f"Please try again tomorrow."
+        )
+        st.stop()
+
+    # ── Gate 3: All API keys present ──
+    keys = get_keys()
+    missing = [n for n, k in [("Groq", keys["groq"]),
+                               ("OpenRouter", keys["openrouter"]),
+                               ("HuggingFace", keys["huggingface"])] if not k]
+    if missing:
+        st.error(f"⚙️ Server config error — missing: **{', '.join(missing)}**. Contact the administrator.")
+        st.stop()
+
+    # ── Record BEFORE running (prevents refresh spam) ──
+    record_request()
 
     prompt = (
         f'A shopper asks: "{query}"\n\n'
@@ -237,12 +372,12 @@ if run:
     )
 
     AI_CONFIG = [
-        ("Llama 3.3 70B",    "Groq",         query_groq,        groq_key),
-        ("DeepSeek V3",      "OpenRouter",   query_openrouter,  gemini_key),
-        ("Qwen 2.5 7B",      "HuggingFace",  query_huggingface, hf_key),
+        ("Llama 3.3 70B", "Groq",        query_groq,        keys["groq"]),
+        ("DeepSeek V3",   "OpenRouter",   query_openrouter,  keys["openrouter"]),
+        ("Qwen 2.5 7B",   "HuggingFace", query_huggingface, keys["huggingface"]),
     ]
 
-    with st.spinner("Querying 3 AIs in parallel… (Gemini retries automatically on errors)"):
+    with st.spinner("Querying 3 AIs in parallel…"):
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
             futures = {name: ex.submit(fn, prompt, key) for name, _, fn, key in AI_CONFIG}
 
@@ -254,12 +389,11 @@ if run:
                 errors[name]  = str(e)
                 results[name] = None
 
-    # Show errors with helpful context
     for name, err in errors.items():
         if "quota" in err.lower() or "429" in err:
             st.warning(f"⚠️ **{name}:** Quota exhausted — {err}")
         elif "unavailable" in err.lower() or "503" in err:
-            st.warning(f"⚠️ **{name}:** Server overloaded after retries — {err}")
+            st.warning(f"⚠️ **{name}:** Server overloaded — {err}")
         elif "not found" in err.lower() or "404" in err:
             st.warning(f"⚠️ **{name}:** Model not found — {err}")
         else:
@@ -273,8 +407,8 @@ if run:
         st.markdown(f"**Tracking:** `{target_product}`")
     st.markdown(f"*Run at {datetime.now().strftime('%H:%M:%S')}*\n")
 
-    score_data = {}
-    cols = st.columns(3)
+    score_data   = {}
+    cols         = st.columns(3)
     grade_colors = {"A":"#22c55e","B":"#84cc16","C":"#eab308","D":"#f97316","F":"#ef4444","—":"#888"}
 
     for i, (name, provider, _, _) in enumerate(AI_CONFIG):
@@ -289,7 +423,7 @@ if run:
                 </div>""", unsafe_allow_html=True)
             continue
 
-        s = score_response(results[name], target_product)
+        s     = score_response(results[name], target_product)
         score_data[name] = s
         grade = s["grade"]
         color = grade_colors.get(grade, "#888")
@@ -311,7 +445,7 @@ if run:
 
     # Verdict
     if target_product and score_data:
-        avg = sum(v["score"] or 0 for v in score_data.values()) / len(score_data)
+        avg     = sum(v["score"] or 0 for v in score_data.values()) / len(score_data)
         verdict = (
             "🟢 **Strong AI presence** — your product is well known to open AI models." if avg >= 70 else
             "🟡 **Moderate presence** — appearing but not dominating. Build more brand signals." if avg >= 45 else
@@ -319,8 +453,11 @@ if run:
         )
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
         st.markdown("### Overall Verdict")
-        st.markdown(f'<div class="summary-bar">{verdict}<br><br><b>Average score across {len(score_data)} AI(s): {avg:.0f} / 100</b></div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="summary-bar">{verdict}<br><br>'
+            f'<b>Average score across {len(score_data)} AI(s): {avg:.0f} / 100</b></div>',
+            unsafe_allow_html=True
+        )
 
     # Brands mentioned
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
@@ -357,8 +494,8 @@ if run:
         if low:
             st.warning(f"**{', '.join(low)}** barely mentions your product. Focus on:")
         st.markdown("""
-- **Build citations** — get mentioned on trusted review sites & forums that AIs train on  
-- **Optimize your listing** — make title, bullets & A+ content crystal clear  
-- **Create Q&A content** — blog posts that directly answer shoppers' questions  
+- **Build citations** — get mentioned on trusted review sites & forums that AIs train on
+- **Optimize your listing** — make title, bullets & A+ content crystal clear
+- **Create Q&A content** — blog posts that directly answer shoppers' questions
 - **Grow reviews** — volume and sentiment on review platforms influences AI rankings
         """)
